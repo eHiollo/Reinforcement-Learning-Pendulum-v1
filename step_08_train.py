@@ -114,7 +114,7 @@ def train(
     def make_env():
         return lambda: PendulumWrapper("Pendulum-v1")
 
-    num_envs = 8  # 推荐 4-16
+    num_envs = 2048  # 推荐 4-16
     env_fns = [make_env() for _ in range(num_envs)]
     envs = SyncVectorEnv(env_fns)
     
@@ -125,6 +125,38 @@ def train(
     opt_critic = optim.Adam(critic.parameters(), lr=lr_critic)
     
     buffer = ExperienceBuffer()
+
+    def collect_experience_vector(envs, actor, buffer, device, max_steps=200):
+        """
+        用 vector 环境并行采样 num_envs 条轨迹，存到 buffer。
+        返回每个环境的总奖励和步数。
+        """
+        num_envs = envs.num_envs
+        states = envs.reset()
+        total_rewards = np.zeros(num_envs)
+        lengths = np.zeros(num_envs, dtype=int)
+        for step in range(max_steps):
+            states_tensor = torch.from_numpy(states).float().to(device)
+            with torch.no_grad():
+                mean, log_std = actor(states_tensor)
+                std = torch.exp(log_std)
+                normal = torch.distributions.Normal(mean, std)
+                action_unbounded = normal.sample()
+                log_prob = normal.log_prob(action_unbounded).sum(dim=-1)
+                action = torch.tanh(action_unbounded) * 2.0
+                log_prob -= torch.log(1 - torch.tanh(action_unbounded).pow(2) + 1e-6).sum(dim=-1)
+                log_prob -= np.log(2.0)
+            actions_np = action.cpu().numpy()
+            next_states, rewards, terminated, truncated, infos = envs.step(actions_np)
+            dones = np.logical_or(terminated, truncated)
+            for i in range(num_envs):
+                buffer.add(states[i], actions_np[i], rewards[i], dones[i], log_prob[i].item())
+                total_rewards[i] += rewards[i]
+                lengths[i] += 1
+            states = next_states
+            if np.all(dones):
+                break
+        return total_rewards, lengths
     
     # 记录训练过程
     episode_rewards = []
