@@ -109,8 +109,14 @@ def train(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}")
     
-    # 环境
-    env = PendulumWrapper("Pendulum-v1")
+    # 多环境并行
+    from gymnasium.vector import SyncVectorEnv
+    def make_env():
+        return lambda: PendulumWrapper("Pendulum-v1")
+
+    num_envs = 8  # 推荐 4-16
+    env_fns = [make_env() for _ in range(num_envs)]
+    envs = SyncVectorEnv(env_fns)
     
     # 网络和优化器
     actor = PPOActor(env.state_dim, env.action_dim, hidden=hidden_dim).to(device)
