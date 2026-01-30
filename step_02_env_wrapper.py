@@ -26,7 +26,7 @@ class PendulumWrapper:
     对外只暴露：reset()、step(action)、close()，以及 state_dim、action_dim。
     """
 
-    def __init__(self, env_name: str = "Pendulum-v1", render_mode: str = None):
+    def __init__(self, env_name: str = "Pendulum-v1", render_mode: str = "human"):
         """
         创建环境，并记下 state_dim、action_dim。
 
@@ -37,18 +37,24 @@ class PendulumWrapper:
         self.observation_space = self.env.observation_space
         self.action_space = self.env.action_space
 
+        # 兼容 vector 环境
+        self.metadata = self.env.metadata
+        self.render_mode = getattr(self.env, 'render_mode', render_mode)
+        self.metadata = self.env.metadata
+
         # 后面建 Actor/Critic 网络时要用的维度
         self.state_dim = self.observation_space.shape[0]   # 3
         self.action_dim = self.action_space.shape[0]       # 1
 
-    def reset(self, seed: int = None):
+    def reset(self, seed: int = None, **kwargs):
         """
-        重置环境，返回初始 state（float32）。
+        重置环境，返回 (obs, info) tuple，兼容 vector 环境。
 
         seed: 随机种子，复现用。
+        kwargs: 其他 gymnasium 可能传递的参数（如 options）。
         """
-        obs, info = self.env.reset(seed=seed)
-        return np.array(obs, dtype=np.float32)
+        obs, info = self.env.reset(seed=seed, **kwargs)
+        return np.array(obs, dtype=np.float32), info
 
     def step(self, action):
         """

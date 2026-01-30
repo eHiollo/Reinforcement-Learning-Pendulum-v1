@@ -5,8 +5,10 @@
 - 可选渲染（看倒立摆动画）
 - 可视化状态、动作、奖励轨迹
 - 分析智能体的表现
+- 生成视频/GIF
 
 运行：python step_09_evaluate.py
+生成视频：python step_09_evaluate.py --video
 """
 
 import numpy as np
@@ -19,23 +21,42 @@ from step_02_env_wrapper import PendulumWrapper
 from step_05_critic import Critic
 from step_06_collect_experience import PPOActor, actor_select_action_with_log_prob
 
+# 视频录制支持
+try:
+    import imageio
+    HAS_IMAGEIO = True
+except ImportError:
+    HAS_IMAGEIO = False
+
 
 # =============================================================================
 # 1. 加载模型
 # =============================================================================
 
 
-def load_model(actor, critic, opt_actor, opt_critic, filepath, device):
-    """加载 Actor 和 Critic 的模型和优化器状态"""
+def load_model(actor, critic, filepath, device):
+    """
+    加载 Actor 和 Critic 的模型状态（评估时不需要优化器）
+    
+    Returns:
+        checkpoint: 完整的checkpoint字典（可用于查看训练信息）
+    """
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"模型文件不存在: {filepath}")
     
-    checkpoint = torch.load(filepath, map_location=device)
+    checkpoint = torch.load(filepath, map_location=device, weights_only=False)
     actor.load_state_dict(checkpoint['actor_state_dict'])
     critic.load_state_dict(checkpoint['critic_state_dict'])
-    opt_actor.load_state_dict(checkpoint['actor_optimizer_state_dict'])
-    opt_critic.load_state_dict(checkpoint['critic_optimizer_state_dict'])
+    
+    # 打印训练信息（如果有）
+    if 'episode' in checkpoint:
+        print(f"模型来自 Episode {checkpoint['episode']}")
+    if 'episode_rewards' in checkpoint and checkpoint['episode_rewards']:
+        rewards = checkpoint['episode_rewards']
+        print(f"训练时最后100回合平均奖励: {np.mean(rewards[-100:]):.2f}")
+    
     print(f"模型已从 {filepath} 加载")
+    return checkpoint
 
 
 # =============================================================================
@@ -49,7 +70,7 @@ def evaluate_episode(env, actor, device, max_steps=200, seed=None, render=False)
     
     返回: (states_history, actions_history, rewards_history, total_reward, length)
     """
-    state = env.reset(seed=seed)
+    state, _ = env.reset(seed=seed)  # Gymnasium返回 (obs, info)
     states_history = [state.copy()]
     actions_history = []
     rewards_history = []
@@ -72,6 +93,8 @@ def evaluate_episode(env, actor, device, max_steps=200, seed=None, render=False)
         actions_history.append(action.copy())
         rewards_history.append(reward)
         total_reward += reward
+
+        env.render()
         
         if render:
             env.render()
@@ -81,6 +104,58 @@ def evaluate_episode(env, actor, device, max_steps=200, seed=None, render=False)
             break
     
     return states_history, actions_history, rewards_history, total_reward, len(rewards_history)
+
+
+def record_video_episode(env, actor, device, max_steps=200, seed=None, video_path="./pendulum_demo.gif"):
+    """
+    录制一个 episode 的视频/GIF
+    """
+    if not HAS_IMAGEIO:
+        print("需要安装 imageio: pip install imageio")
+        print("运行: pip install imageio imageio-ffmpeg")
+        return None
+    
+    import imageio  # 在函数内部导入，避免未定义错误
+    import gymnasium as gym
+    
+    # 创建一个新的环境用于录制（rgb_array模式）
+    raw_env = gym.make("Pendulum-v1", render_mode="human")
+    
+    frames = []
+    state, _ = raw_env.reset(seed=seed)
+    
+    # 录制第一帧
+    frames.append(raw_env.render())
+    
+    for step in range(max_steps):
+        state_tensor = torch.from_numpy(state).float().unsqueeze(0).to(device)
+        with torch.no_grad():
+            mean, log_std = actor(state_tensor)
+            action_unbounded = mean
+            action = torch.tanh(action_unbounded) * 2.0
+            action = action.squeeze(0).cpu().numpy()
+        
+        next_state, reward, terminated, truncated, _ = raw_env.step(action)
+        done = terminated or truncated
+        
+        # 录制帧
+        frames.append(raw_env.render())
+        
+        state = next_state
+        if done:
+            break
+    
+    raw_env.close()
+    
+    # 保存为 GIF
+    if video_path.endswith('.gif'):
+        imageio.mimsave(video_path, frames, fps=30, loop=0)
+    else:
+        # 保存为 MP4
+        imageio.mimsave(video_path, frames, fps=30)
+    
+    print(f"视频已保存到: {video_path}")
+    return frames
 
 
 # =============================================================================
@@ -142,11 +217,12 @@ def visualize_episode(states_history, actions_history, rewards_history,
 
 
 def evaluate(
-    model_path="./models/ppo_pendulum_final.pth",
+    model_path="models/ppo_pendulum_episode_2300.pth",
     num_episodes=10,
     max_steps_per_episode=200,
-    render=False,
+    render=True,
     seed=42,
+    hidden_dim=64,  # 需要与训练时一致
 ):
     """
     评估训练好的模型
@@ -156,15 +232,21 @@ def evaluate(
     print("=" * 50)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    env = PendulumWrapper("Pendulum-v1", render_mode="human" if render else None)
+    print(f"使用设备: {device}")
     
-    actor = PPOActor(env.state_dim, env.action_dim, hidden=64).to(device)
-    critic = Critic(env.state_dim, hidden=64).to(device)
-    opt_actor = torch.optim.Adam(actor.parameters(), lr=3e-4)
-    opt_critic = torch.optim.Adam(critic.parameters(), lr=3e-4)
+    render_mode = "human" if render else "rgb_array"
+    env = PendulumWrapper("Pendulum-v1", render_mode=render_mode)
     
-    # 加载模型
-    load_model(actor, critic, opt_actor, opt_critic, model_path, device)
+    # 创建网络（hidden_dim需要与训练时一致）
+    actor = PPOActor(env.state_dim, env.action_dim, hidden=hidden_dim).to(device)
+    critic = Critic(env.state_dim, hidden=hidden_dim).to(device)
+    
+    # 加载模型（评估时不需要优化器）
+    checkpoint = load_model(actor, critic, model_path, device)
+    
+    # 设置为评估模式
+    actor.eval()
+    critic.eval()
     
     print(f"\n评估配置:")
     print(f"  - Episode 数: {num_episodes}")
@@ -214,17 +296,90 @@ def evaluate(
 
 
 if __name__ == "__main__":
-    # 评估模型（需要先训练模型）
-    model_path = "models/ppo_pendulum_episode_400.pth"
+    import argparse
     
-    if os.path.exists(model_path):
+    # 解析命令行参数
+    parser = argparse.ArgumentParser(description='评估PPO训练的模型')
+    parser.add_argument('--model', '-m', type=str, default="models/ppo_pendulum_episode_2300.pth",
+                        help='模型文件路径（默认使用最新的模型）')
+    parser.add_argument('--episodes', '-n', type=int, default=20,
+                        help='评估的episode数量（默认10）')
+    parser.add_argument('--render', '-r', action='store_true',
+                        help='是否渲染动画（需要图形界面）')
+    parser.add_argument('--video', '-v', action='store_true',
+                        help='录制视频/GIF')
+    parser.add_argument('--video-path', type=str, default='./pendulum_demo.gif',
+                        help='视频保存路径（默认 ./pendulum_demo.gif）')
+    parser.add_argument('--seed', '-s', type=int, default=3,
+                        help='随机种子（默认42）')
+    args = parser.parse_args()
+    
+    # 如果没有指定模型，自动查找最新的模型
+    models_dir = "models"
+    if args.model is None:
+        if os.path.exists(models_dir):
+            available = [f for f in os.listdir(models_dir) if f.endswith('.pth')]
+            if available:
+                # 按episode数字排序，选择最新的
+                def get_episode_num(filename):
+                    try:
+                        # 格式: ppo_pendulum_episode_XXX.pth
+                        return int(filename.split('_')[-1].replace('.pth', ''))
+                    except:
+                        return 0
+                available.sort(key=get_episode_num, reverse=True)
+                model_path = os.path.join(models_dir, available[0])
+                print(f"自动选择最新模型: {model_path}")
+            else:
+                print(f"models目录中没有找到模型文件")
+                model_path = None
+        else:
+            print(f"models目录不存在")
+            model_path = None
+    else:
+        model_path = args.model
+    
+    if model_path and os.path.exists(model_path):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        actor = PPOActor(3, 1, hidden=64).to(device)
+        critic = Critic(3, hidden=64).to(device)
+        load_model(actor, critic, model_path, device)
+        actor.eval()
+        
+        # 默认生成视频（WSL环境下无法直接显示图形界面）
+        if args.video or not args.render:
+            print("=" * 50)
+            print("录制视频（WSL环境下推荐方式）...")
+            print("=" * 50)
+            try:
+                record_video_episode(None, actor, device, max_steps=200, 
+                                   seed=args.seed, video_path=args.video_path)
+                abs_path = os.path.abspath(args.video_path)
+                print(f"\n✅ 视频已保存到: {abs_path}")
+                print(f"\n在 Windows 中查看视频的方法：")
+                print(f"  1. 在文件资源管理器地址栏输入：\\\\wsl$\\Ubuntu{abs_path}")
+                print(f"  2. 或者直接复制到Windows：cp {abs_path} /mnt/c/Users/你的用户名/Desktop/")
+            except Exception as e:
+                print(f"⚠️  录制视频失败: {e}")
+                print("   提示: 运行 'pip install imageio imageio-ffmpeg' 安装依赖")
+        
+        # 运行评估
         evaluate(
             model_path=model_path,
-            num_episodes=10,
+            num_episodes=args.episodes,
             max_steps_per_episode=200,
-            render=False,  # 设为 True 可以看到动画（需要图形界面）
-            seed=42,
+            render=args.render,
+            seed=args.seed,
+            hidden_dim=64,  # 需要与训练时一致
         )
     else:
-        print(f"模型文件不存在: {model_path}")
+        if model_path:
+            print(f"模型文件不存在: {model_path}")
         print("请先运行 step_08_train.py 训练模型")
+        # 列出可用的模型文件
+        if os.path.exists(models_dir):
+            available = [f for f in os.listdir(models_dir) if f.endswith('.pth')]
+            if available:
+                print(f"\n可用的模型文件:")
+                for f in sorted(available):
+                    print(f"  - {models_dir}/{f}")

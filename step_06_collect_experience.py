@@ -46,7 +46,10 @@ class PPOActor(nn.Module):
         x = torch.relu(self.fc1(state))
         x = torch.relu(self.fc2(x))
         mean = self.mean_layer(x)
-        log_std = torch.clamp(self.log_std_layer(x), min=-20, max=2)  # 限制范围
+        # 【关键修复】限制log_std范围，防止策略崩溃
+        # min=-20 太小了，exp(-20) ≈ 0，导致策略变成确定性的，不再探索
+        # min=-2 意味着 std >= exp(-2) ≈ 0.135，保证有足够的探索
+        log_std = torch.clamp(self.log_std_layer(x), min=-2, max=2)
         return mean, log_std
 
 
@@ -59,21 +62,32 @@ class PPOActor(nn.Module):
 
 class ExperienceBuffer:
     """
-    经验缓冲区：存一个 episode 或一段轨迹的 (s, a, r, done, log_prob)。
+    经验缓冲区：存一个 episode 或一段轨迹的 (s, a, r, s', done, log_prob)。
+    
+    【优化：添加next_states】
+    - 用于GAE（广义优势估计）计算
+    - GAE需要V(s_{t+1})来计算TD误差
     """
 
     def __init__(self):
         self.states = []
         self.actions = []
         self.rewards = []
+        self.next_states = []  # 【新增】用于GAE计算
         self.dones = []
         self.log_probs = []
 
-    def add(self, state, action, reward, done, log_prob):
-        """存一个 transition"""
+    def add(self, state, action, reward, next_state, done, log_prob):
+        """
+        存一个 transition
+        
+        Args:
+            next_state: 下一个状态，用于GAE计算
+        """
         self.states.append(state)
         self.actions.append(action)
         self.rewards.append(reward)
+        self.next_states.append(next_state)  # 【新增】
         self.dones.append(done)
         self.log_probs.append(log_prob)
 
@@ -82,6 +96,7 @@ class ExperienceBuffer:
         self.states = []
         self.actions = []
         self.rewards = []
+        self.next_states = []  # 【新增】
         self.dones = []
         self.log_probs = []
 
@@ -137,14 +152,15 @@ def collect_experience(env, actor, buffer, device, max_steps=200, seed=None):
     """
     state = env.reset(seed=seed)
     total_reward = 0.0
+    step = 0  # 初始化step，防止未定义
 
     for step in range(max_steps):
         action, log_prob = actor_select_action_with_log_prob(actor, state, device)
         next_state, reward, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
 
-        # 存经验
-        buffer.add(state, action, reward, done, log_prob)
+        # 存经验（包含next_state用于GAE）
+        buffer.add(state, action, reward, next_state, done, log_prob)
 
         state = next_state
         total_reward += reward
